@@ -1,150 +1,165 @@
-# PULSEBOT — Phase 2
+﻿# PULSEBOT
 
-A Telegram bot for scheduled and on-demand website/API checks with incident alerts.
-Endpoints belong to the
-Telegram user who saved them and survive restarts in SQLite. Built with Python 3.12+,
-aiogram 3, aiohttp, SQLAlchemy 2 async, aiosqlite and Pydantic Settings.
+A Python Telegram bot that checks public HTTPS websites and API endpoints, records
+their health in SQLite, and notifies their owners when availability changes.
 
-## Windows PowerShell setup
+This backend portfolio project demonstrates asynchronous I/O, modular design,
+transactional persistence, defensive HTTP handling, and offline testing.
+**PULSEBOT runs locally and is not currently deployed for 24/7 monitoring.** Checks
+and alerts require the process to remain running with an Internet connection.
 
-Install Python 3.12 or newer, then run from this folder:
+## Screenshots
+
+![Telegram bot commands and status](docs/screenshots/telegram-bot.jpg)
+
+*Telegram commands and endpoint status in a private bot chat.*
+
+![Monitoring history or manual website check](docs/screenshots/monitoring-history.jpg)
+
+*Recorded monitoring results and website health checks.*
+
+## Key features
+
+- Scheduled and manual HTTPS checks with HTTP status, response latency, and UTC timestamps.
+- DOWN and recovery (UP) alerts on state changes, with persisted duplicate suppression.
+- Telegram user ownership for endpoint management, status, and history.
+- Bounded concurrency, per-endpoint overlap prevention, local process locking,
+  and graceful shutdown.
+- URL, DNS, and socket-level SSRF controls with verified TLS connections.
+
+## Tech stack and architecture
+
+Python **3.12+**, aiogram **3**, aiohttp, SQLAlchemy **2** async with aiosqlite,
+Pydantic Settings, and certifi. Development tools: pytest, pytest-asyncio, and Ruff.
+Dependencies and tool settings are defined in [pyproject.toml](pyproject.toml).
+
+| Module | Responsibility |
+| --- | --- |
+| `app/__main__.py` | Startup, dependency injection, Telegram long polling, and cleanup |
+| `app/config.py` | Validated environment configuration and secret token type |
+| `app/handlers.py` | Commands, private-chat checks, and user-facing responses |
+| `app/monitor.py` | Shared manual/scheduled check coordination and incident delivery |
+| `app/checker.py` | Async HTTPS requests, redirects, timeouts, and latency |
+| `app/security.py` | URL policy, validating DNS resolver, and socket factory |
+| `app/db.py` | SQLite models, owner-scoped queries, history, and incident outbox |
+| `app/instance.py` | OS file lock for one monitoring process per local database |
+
+Handlers and the scheduler share a monitoring service. Results go through the
+repository; a separate async task delivers persisted incident events to Telegram.
+SQLite stores endpoints, checks, and incidents. Startup creates missing tables,
+including Phase 2 tables for an existing Phase 1 database without replacing endpoints.
+
+## Run locally on Windows
+
+Install Python 3.12 or newer. From the project root in PowerShell:
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item .env.example .env
-notepad .env
 ```
 
-Create a bot using Telegram's @BotFather and set `BOT_TOKEN` in `.env`. Keep this
-file private; it is ignored by Git. Never paste tokens into commands or logs.
-Environment variables override `.env`. No shell activation is required.
-
-If the Windows launcher does not find an installed Python, use its full path for
-the first command, for example:
+If the Python launcher cannot find your installation, replace the first command
+with its executable path, for example:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m venv .venv
 ```
 
+Copy the configuration template without overwriting an existing `.env`:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+notepad .env
+```
+
+Create a bot through Telegram's **@BotFather** and set `BOT_TOKEN` in your local
+`.env`. Keep the token private; never include it in screenshots, commands, or shared
+logs. Environment variables override `.env` values. Shell activation is not required.
+
 ```powershell
 .\.venv\Scripts\python.exe -m app
 ```
 
-Open a private Telegram chat with your bot. Stop locally with Ctrl+C. Run only one
-polling process for a bot token.
+Open a private chat with your bot and send `/start`. Stop with **Ctrl+C**; shutdown
+cancels and awaits active monitoring work before closing resources. Run one process
+per bot and local database. A second Phase 2 process using the same resolved database
+path is rejected by an OS lock.
 
-## Commands
-
-| Command | Behavior |
-| --- | --- |
-| `/start`, `/help` | Usage guide |
-| `/add https://example.com/health` | Save an endpoint; returns its ID |
-| `/list` | List your endpoints |
-| `/remove 1` | Remove your endpoint |
-| `/check 1` | Send an HTTPS GET and report status and latency |
-| `/status` | Show the latest recorded state of your endpoints |
-| `/history 1` | Show your endpoint's last 10 checks, newest first, in UTC |
-
-An endpoint is healthy when its final response status is 200–399. HTTP 4xx/5xx
-responses are unhealthy. Connection, DNS, TLS, timeout and blocked-destination
-failures produce friendly messages. Latency is measured with a monotonic clock
-through receipt of final response headers, including DNS, TLS and redirects; the
-body is not downloaded. Queue time waiting for a check slot is excluded.
-
-## Configuration
+### Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BOT_TOKEN` | required | Secret Telegram token |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./pulsebot.db` | SQLite database relative to current folder |
-| `HTTP_TIMEOUT_SECONDS` | `10` | Total per-check deadline, including redirects (up to 60s) |
+| `BOT_TOKEN` | Required | Telegram bot credential |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./pulsebot.db` | SQLite file, relative to the working directory |
+| `MONITOR_INTERVAL_SECONDS` | `60` | Target cycle interval (1–86400 seconds) |
+| `HTTP_TIMEOUT_SECONDS` | `10` | Total check deadline including redirects (greater than 0, up to 60 seconds) |
+| `MAX_CONCURRENT_CHECKS` | `10` | Shared active-check limit (1–100) |
 | `MAX_REDIRECTS` | `3` | Maximum redirect hops (0–10) |
-| `MAX_CONCURRENT_CHECKS` | `10` | Simultaneous HTTP checks (1–100) |
-| `MONITOR_INTERVAL_SECONDS` | `60` | Interval between cycle starts (1–86400 seconds) |
 
-## Architecture
+## Telegram commands
 
-```text
-app/
-  __main__.py   configuration, database lifecycle, Telegram long polling
-  config.py     validated environment settings; token stored as SecretStr
-  handlers.py   command parsing, private-chat enforcement, friendly responses
-  db.py         endpoint model and user-scoped async repository
-  checker.py    reusable bounded HTTP checker, redirects and result model
-  security.py   URL policy, validating DNS resolver and socket factory
-  monitor.py    shared check coordination, scheduler and incident delivery
-  instance.py   local OS lock for one process per SQLite database
-tests/          offline configuration, security, checker, storage and handler tests
-```
+Use commands in a private chat. Replace `1` with an endpoint ID returned by `/add`.
 
-The dispatcher injects the repository and monitoring service into handlers. Every lookup and
-deletion includes the Telegram user ID. A database constraint prevents duplicate
-URLs for the same user. Schema creation happens at startup; no migration framework
-is included in this phase. On startup, Phase 2 adds `checks` and `incidents` tables
-without changing or deleting existing Phase 1 endpoint records. Tests cover this upgrade.
+| Command | Behavior |
+| --- | --- |
+| `/start`, `/help` | Show commands, monitoring behavior, and security guidance |
+| `/add https://example.com` | Save a public HTTPS endpoint for monitoring |
+| `/list` | List your saved endpoint IDs and URLs |
+| `/check 1` | Run and save a manual check; report HTTP status and latency |
+| `/status` | Show each endpoint's latest recorded state, or UNKNOWN before its first check |
+| `/history 1` | Show the latest 10 checks, newest first, with UTC timestamps |
+| `/remove 1` | Delete your endpoint, its check history, and incident records |
 
-## Scheduling and incidents
+## Monitoring and alert semantics
 
-The first cycle starts immediately; subsequent cycles start every 60 seconds by
-default while the process runs. A slow cycle finishes before another starts; missed
-ticks are not replayed. Endpoints are read in bounded batches. Manual `/check` and
-scheduled checks share a concurrency limit and per-endpoint exclusion: a manual
-request reports when a check is already running, and the scheduler skips a busy
-endpoint. All use the same timeout, TLS verification and SSRF-protected checker.
+The first cycle starts immediately. Subsequent cycles target **60 seconds** between
+starts by default. Slow cycles finish before another starts; missed ticks are not
+replayed. Endpoints are processed in bounded batches. Manual and scheduled checks
+share concurrency controls: a manual request reports an already-running check,
+and the scheduler skips a busy endpoint.
 
-Every completed check stores its UP/DOWN state, HTTP status (nullable for connection
-failures), latency, safe error text, start time and completion time in UTC. Both manual
-and scheduled checks update the same state. The first result establishes a baseline
-(even if DOWN) and sends no alert. UP → DOWN sends an incident alert; DOWN → UP sends
-a recovery alert. Repeated results in the same state send nothing. State and an outbox
-event are committed together in a serialized SQLite transaction. History and pending
-events survive restarts; restarting does not reset the baseline.
+A successful check with final HTTP **200–399** is UP. HTTP 4xx/5xx, connection errors,
+timeouts, TLS failures, and blocked destinations are DOWN. Latency uses a monotonic
+clock through final response headers, including DNS, TLS, and redirects; waiting
+for a concurrency slot is excluded. Response bodies are not evaluated.
 
-An independent task sends outbox events only to the endpoint owner's private chat,
-using a 15-second send timeout. Events are claimed atomically before contacting
-Telegram, so the same event is never automatically resent after an ambiguous timeout
-or crash. Telegram's explicit rate-limit rejection is retried after its requested
-delay. Other failed/uncertain sends remain recorded without automatic retries.
-This is **at-most-once delivery**, not guaranteed delivery: Telegram has no idempotency
-key, so preventing duplicate alerts means a crash between claiming and sending can
-lose an alert. Pending, unclaimed events are delivered after restart. Incident IDs
-appear in messages for correlation. The outbox stores `pending`, `attempted`, `sent`
-and `uncertain` delivery states; `attempted` may mean interrupted delivery.
+The first result establishes a baseline and sends no alert, even when DOWN.
+**UP → DOWN** creates a DOWN alert; **DOWN → UP** creates a recovery alert labeled UP.
+Unchanged states create no notification. Manual and scheduled results update the
+same persisted state, status, latency, safe error text, and UTC timestamps.
 
-A local OS file lock beside the SQLite database prevents two processes from running
-schedulers against the same resolved database path. The lock is released by the OS
-on process exit; its file may remain and should not be deleted while running. This
-supports one host and a local file-backed SQLite database, not distributed workers,
-network filesystems or separate database files for the same bot. Do not run Phase 1
-and Phase 2 processes together. Ctrl+C stops scheduling, cancels and awaits active
-checks/alert delivery, then closes Telegram and database resources. Incomplete checks
-are not saved as DOWN. Removing an endpoint also deletes its history and pending events.
+Results and transition events commit together in a serialized SQLite transaction.
+An outbox worker claims each event before sending it to its owner's chat, with a
+15-second delivery timeout. Pending events and the baseline survive restarts; sent
+events are not replayed. Telegram's explicit rate-limit rejection is retried after
+the requested delay; other failed or uncertain deliveries are not retried.
 
-## SSRF policy
+This favors **at-most-once delivery over guaranteed delivery**: a crash or timeout
+after claiming an event can lose an alert. Delivery states (`pending`, `attempted`,
+`sent`, `uncertain`) remain in the database for inspection.
 
-Only HTTPS on port 443 is accepted. Credentials, control characters, backslashes,
-local names, private, loopback, link-local, shared, multicast, reserved and other
-non-global IP addresses are blocked. IPv6 transition/mapped addresses are also
-blocked. Domain names must have public-style DNS labels. URL validation happens
-before saving and again before checking. Saving a hostname does not resolve it or
-promise reachability: DNS is evaluated at connection time.
+## HTTP security
 
-The custom resolver checks **all** returned addresses and rejects mixed public and
-private answers. DNS caching is disabled and connections are not reused. A socket
-factory independently validates the exact numeric destination immediately before
-socket creation, including IP literals which bypass the resolver. The connector
-connects to those validated numeric addresses, avoiding a second unchecked DNS lookup.
-Redirects are followed manually with the same policy and a hop limit. TLS certificate
-verification stays enabled; environment proxies and cookies are disabled.
-The checker uses Python's default TLS context (including system trust) supplemented
-with certifi's CA bundle. This supports Windows Python installations whose local
-issuer store is incomplete, while retaining certificate and hostname verification.
-See the [aiohttp connector documentation](https://docs.aiohttp.org/en/stable/client_advanced.html)
-for the underlying resolver and socket-factory interfaces.
+- Accept only public HTTPS URLs on port 443; reject URL credentials, control
+  characters, backslashes, local names, and non-public IP destinations, including
+  private, loopback, link-local, shared, multicast, and reserved addresses.
+  IPv6 mapped and transition addresses are also blocked.
+- Validate URLs before saving and checking. At connection time, validate **all** DNS
+  answers, rejecting mixed public/private results. DNS caching and connection reuse
+  are disabled; the socket factory also checks the exact numeric destination before
+  socket creation, including literal IP URLs.
+- Follow redirects manually with destination validation and a hop limit. Disable
+  environment proxies and cookies for endpoint checks.
+- Keep TLS certificate and hostname verification enabled. Supplement Python's
+  default system trust with certifi's CA bundle, including for Windows installations
+  with incomplete local issuer trust.
 
-## Verification
+URLs are stored as plaintext and shown to their owners. Do not include secrets in
+paths or query parameters. Protect the database and `.env` with local file permissions.
+
+## Tests and linting
+
+After installing the `dev` extra, run from the project root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
@@ -152,55 +167,23 @@ for the underlying resolver and socket-factory interfaces.
 .\.venv\Scripts\python.exe -m ruff format --check .
 ```
 
-Tests mock HTTP, DNS and Telegram interactions, use temporary SQLite databases and
-block real socket connections/DNS. No Telegram token, `.env` or network is needed.
+The suite uses mocked HTTP, DNS, and Telegram interactions, temporary SQLite
+databases, and a fixture that blocks socket connections and DNS lookups. It requires
+no real Telegram token, `.env`, or network access. Tests cover SSRF and TLS controls,
+ownership, persistence, scheduler coordination, and incident delivery. An integration
+test verifies **200 → 503 → 503 → 200** produces one DOWN and one UP alert, including
+restart behavior and persisted history.
 
-To diagnose connectivity without reading `.env`, using Telegram, or touching the
-database, run the fixed-target diagnostic:
+## Scope and limitations
 
-```powershell
-.\.venv\Scripts\python.exe -m scripts.diagnose_https
-```
-
-This contacts only `https://example.com` (no redirects), compares verified system
-TLS trust with system trust plus certifi, then runs the application checker. It prints
-only status, exception types and numeric error codes. A code 20 certificate failure
-with system defaults followed by HTTP 200 with certifi identifies a missing local
-issuer trust problem. Network sandbox permission failures are separate from TLS failures.
-
-## Verify scheduled monitoring locally
-
-Restart the bot with the existing `.env` and database (do not copy `.env.example`
-over your configuration):
-
-```powershell
-.\.venv\Scripts\python.exe -m app
-```
-
-In your private bot chat, use `/list`, `/check 1`, `/status` and `/history 1` (replace
-`1` with your endpoint ID). Wait at least one interval and run `/history 1` again;
-another scheduled result should appear. For a transition test, use a public HTTPS
-endpoint you control: establish UP, change it to return 503, wait for DOWN and one
-alert, keep it DOWN for another cycle (no new alert), then restore 200 and wait for
-one UP alert. Restart and confirm history persists and unchanged state sends no alert.
-Starting a second process with the same database should exit with an already-running
-message. No Telegram/network access is used by the automated tests.
-
-## Limitations
-
-- No AI, dashboard or cloud deployment.
-- Only public HTTPS on port 443; no authentication headers, custom request methods,
-  payloads, response-body assertions or internal endpoints.
-- No uptime percentages, general migration framework, user quotas or history retention
-  policy. History grows until its endpoint is removed. No checks run while the process
-  is stopped, and no missed intervals are backfilled. Alert delivery has the at-most-once
-  limitation described above. The concurrency bound limits active checks, not queued
-  Telegram updates.
-- URLs are stored as plaintext and visible to their owner in Telegram. Avoid secrets
-  in paths/query parameters. SQLite and local file access must be protected by the operator.
-- Checks reflect one network vantage point and header availability, not application
-  correctness. Application filtering cannot protect against unusual routing or NAT
-  configurations that remap public addresses; network egress controls are an additional
-  production safeguard. No deployment configuration is included.
-- Dependencies use compatible version ranges rather than a reproducible lockfile.
-  Review and lock resolved dependencies before a production release.
+- Local operation only: no hosted 24/7 service, deployment configuration, dashboard,
+  or AI features. No checks run while the process is stopped or the computer is asleep.
+- Public HTTPS GET checks only; no authentication headers, request payloads, body
+  assertions, or internal endpoints. Availability reflects one network vantage point,
+  not full application correctness.
+- Single-host, file-backed SQLite operation. The process lock does not coordinate
+  separate database files or distributed workers. No uptime percentages, user quotas,
+  general migration framework, or automatic history retention policy.
+- Application SSRF controls do not account for unusual routing/NAT that remaps public
+  addresses. Production use would also require appropriate network egress controls.
+- Dependency ranges are defined in `pyproject.toml`; a reproducible lockfile is not included.
